@@ -7,7 +7,7 @@ use tempfile::tempfile;
 
 cfg_if! {
     if #[cfg(any(target_os = "android", target_os = "linux"))] {
-        use nix::unistd::{close, pipe, read};
+        use nix::unistd::{pipe, read};
     } else if #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "ios", target_os = "macos"))] {
         use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
@@ -23,17 +23,15 @@ fn test_sendfile_linux() {
 
     let (rd, wr) = pipe().unwrap();
     let mut offset: off_t = 5;
-    let res = sendfile(wr, tmp.as_raw_fd(), Some(&mut offset), 2).unwrap();
+    let res = sendfile(wr.as_raw_fd(), tmp.as_raw_fd(), Some(&mut offset), 2)
+        .unwrap();
 
     assert_eq!(2, res);
 
     let mut buf = [0u8; 1024];
-    assert_eq!(2, read(rd, &mut buf).unwrap());
+    assert_eq!(2, read(&rd, &mut buf).unwrap());
     assert_eq!(b"f1", &buf[0..2]);
     assert_eq!(7, offset);
-
-    close(rd).unwrap();
-    close(wr).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -45,17 +43,15 @@ fn test_sendfile64_linux() {
 
     let (rd, wr) = pipe().unwrap();
     let mut offset: libc::off64_t = 5;
-    let res = sendfile64(wr, tmp.as_raw_fd(), Some(&mut offset), 2).unwrap();
+    let res = sendfile64(wr.as_raw_fd(), tmp.as_raw_fd(), Some(&mut offset), 2)
+        .unwrap();
 
     assert_eq!(2, res);
 
     let mut buf = [0u8; 1024];
-    assert_eq!(2, read(rd, &mut buf).unwrap());
+    assert_eq!(2, read(&rd, &mut buf).unwrap());
     assert_eq!(b"f1", &buf[0..2]);
     assert_eq!(7, offset);
-
-    close(rd).unwrap();
-    close(wr).unwrap();
 }
 
 #[cfg(target_os = "freebsd")]

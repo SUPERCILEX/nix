@@ -10,11 +10,11 @@ pub use libc::stat as FileStat;
 pub use libc::{dev_t, mode_t};
 
 #[cfg(not(target_os = "redox"))]
-use crate::fcntl::{at_rawfd, AtFlags};
+use crate::fcntl::AtFlags;
 use crate::sys::time::{TimeSpec, TimeVal};
 use crate::{errno::Errno, NixPath, Result};
 use std::mem;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 
 libc_bitflags!(
     /// "File type" flags for `mknod` and related functions.
@@ -156,8 +156,8 @@ libc_bitflags! {
 }
 
 /// Create a special or ordinary file, by pathname.
-pub fn mknod<P: ?Sized + NixPath>(
-    path: &P,
+pub fn mknod(
+    path: &(impl ?Sized + NixPath),
     kind: SFlag,
     perm: Mode,
     dev: dev_t,
@@ -177,16 +177,16 @@ pub fn mknod<P: ?Sized + NixPath>(
     target_os = "haiku"
 )))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn mknodat<P: ?Sized + NixPath>(
-    dirfd: RawFd,
-    path: &P,
+pub fn mknodat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     kind: SFlag,
     perm: Mode,
     dev: dev_t,
 ) -> Result<()> {
     let res = path.with_nix_path(|cstr| unsafe {
         libc::mknodat(
-            dirfd,
+            dirfd.as_fd().as_raw_fd(),
             cstr.as_ptr(),
             kind.bits | perm.bits() as mode_t,
             dev,
@@ -222,7 +222,7 @@ pub fn umask(mode: Mode) -> Mode {
     Mode::from_bits(prev).expect("[BUG] umask returned invalid Mode")
 }
 
-pub fn stat<P: ?Sized + NixPath>(path: &P) -> Result<FileStat> {
+pub fn stat(path: &(impl ?Sized + NixPath)) -> Result<FileStat> {
     let mut dst = mem::MaybeUninit::uninit();
     let res = path.with_nix_path(|cstr| unsafe {
         libc::stat(cstr.as_ptr(), dst.as_mut_ptr())
@@ -233,7 +233,7 @@ pub fn stat<P: ?Sized + NixPath>(path: &P) -> Result<FileStat> {
     Ok(unsafe { dst.assume_init() })
 }
 
-pub fn lstat<P: ?Sized + NixPath>(path: &P) -> Result<FileStat> {
+pub fn lstat(path: &(impl ?Sized + NixPath)) -> Result<FileStat> {
     let mut dst = mem::MaybeUninit::uninit();
     let res = path.with_nix_path(|cstr| unsafe {
         libc::lstat(cstr.as_ptr(), dst.as_mut_ptr())
@@ -244,9 +244,9 @@ pub fn lstat<P: ?Sized + NixPath>(path: &P) -> Result<FileStat> {
     Ok(unsafe { dst.assume_init() })
 }
 
-pub fn fstat(fd: RawFd) -> Result<FileStat> {
+pub fn fstat(fd: &impl AsFd) -> Result<FileStat> {
     let mut dst = mem::MaybeUninit::uninit();
-    let res = unsafe { libc::fstat(fd, dst.as_mut_ptr()) };
+    let res = unsafe { libc::fstat(fd.as_fd().as_raw_fd(), dst.as_mut_ptr()) };
 
     Errno::result(res)?;
 
@@ -255,15 +255,15 @@ pub fn fstat(fd: RawFd) -> Result<FileStat> {
 
 #[cfg(not(target_os = "redox"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn fstatat<P: ?Sized + NixPath>(
-    dirfd: RawFd,
-    pathname: &P,
+pub fn fstatat(
+    dirfd: &impl AsFd,
+    pathname: &(impl ?Sized + NixPath),
     f: AtFlags,
 ) -> Result<FileStat> {
     let mut dst = mem::MaybeUninit::uninit();
     let res = pathname.with_nix_path(|cstr| unsafe {
         libc::fstatat(
-            dirfd,
+            dirfd.as_fd().as_raw_fd(),
             cstr.as_ptr(),
             dst.as_mut_ptr(),
             f.bits() as libc::c_int,
@@ -280,8 +280,9 @@ pub fn fstatat<P: ?Sized + NixPath>(
 /// # References
 ///
 /// [fchmod(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/fchmod.html).
-pub fn fchmod(fd: RawFd, mode: Mode) -> Result<()> {
-    let res = unsafe { libc::fchmod(fd, mode.bits() as mode_t) };
+pub fn fchmod(fd: &impl AsFd, mode: Mode) -> Result<()> {
+    let res =
+        unsafe { libc::fchmod(fd.as_fd().as_raw_fd(), mode.bits() as mode_t) };
 
     Errno::result(res).map(drop)
 }
@@ -311,9 +312,9 @@ pub enum FchmodatFlags {
 /// [fchmodat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/fchmodat.html).
 #[cfg(not(target_os = "redox"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn fchmodat<P: ?Sized + NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
+pub fn fchmodat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     mode: Mode,
     flag: FchmodatFlags,
 ) -> Result<()> {
@@ -323,7 +324,7 @@ pub fn fchmodat<P: ?Sized + NixPath>(
     };
     let res = path.with_nix_path(|cstr| unsafe {
         libc::fchmodat(
-            at_rawfd(dirfd),
+            dirfd.as_fd().as_raw_fd(),
             cstr.as_ptr(),
             mode.bits() as mode_t,
             atflag.bits() as libc::c_int,
@@ -343,8 +344,8 @@ pub fn fchmodat<P: ?Sized + NixPath>(
 /// # References
 ///
 /// [utimes(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/utimes.html).
-pub fn utimes<P: ?Sized + NixPath>(
-    path: &P,
+pub fn utimes(
+    path: &(impl ?Sized + NixPath),
     atime: &TimeVal,
     mtime: &TimeVal,
 ) -> Result<()> {
@@ -375,8 +376,8 @@ pub fn utimes<P: ?Sized + NixPath>(
     target_os = "netbsd"
 ))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn lutimes<P: ?Sized + NixPath>(
-    path: &P,
+pub fn lutimes(
+    path: &(impl ?Sized + NixPath),
     atime: &TimeVal,
     mtime: &TimeVal,
 ) -> Result<()> {
@@ -394,9 +395,13 @@ pub fn lutimes<P: ?Sized + NixPath>(
 ///
 /// [futimens(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/futimens.html).
 #[inline]
-pub fn futimens(fd: RawFd, atime: &TimeSpec, mtime: &TimeSpec) -> Result<()> {
+pub fn futimens(
+    fd: &impl AsFd,
+    atime: &TimeSpec,
+    mtime: &TimeSpec,
+) -> Result<()> {
     let times: [libc::timespec; 2] = [*atime.as_ref(), *mtime.as_ref()];
-    let res = unsafe { libc::futimens(fd, &times[0]) };
+    let res = unsafe { libc::futimens(fd.as_fd().as_raw_fd(), &times[0]) };
 
     Errno::result(res).map(drop)
 }
@@ -427,9 +432,9 @@ pub enum UtimensatFlags {
 /// [utimensat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/utimens.html).
 #[cfg(not(target_os = "redox"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn utimensat<P: ?Sized + NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
+pub fn utimensat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     atime: &TimeSpec,
     mtime: &TimeSpec,
     flag: UtimensatFlags,
@@ -441,7 +446,7 @@ pub fn utimensat<P: ?Sized + NixPath>(
     let times: [libc::timespec; 2] = [*atime.as_ref(), *mtime.as_ref()];
     let res = path.with_nix_path(|cstr| unsafe {
         libc::utimensat(
-            at_rawfd(dirfd),
+            dirfd.as_fd().as_raw_fd(),
             cstr.as_ptr(),
             &times[0],
             atflag.bits() as libc::c_int,
@@ -453,13 +458,17 @@ pub fn utimensat<P: ?Sized + NixPath>(
 
 #[cfg(not(target_os = "redox"))]
 #[cfg_attr(docsrs, doc(cfg(all())))]
-pub fn mkdirat<P: ?Sized + NixPath>(
-    fd: RawFd,
-    path: &P,
+pub fn mkdirat(
+    fd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     mode: Mode,
 ) -> Result<()> {
     let res = path.with_nix_path(|cstr| unsafe {
-        libc::mkdirat(fd, cstr.as_ptr(), mode.bits() as mode_t)
+        libc::mkdirat(
+            fd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            mode.bits() as mode_t,
+        )
     })?;
 
     Errno::result(res).map(drop)

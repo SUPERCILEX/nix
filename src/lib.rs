@@ -157,6 +157,7 @@ pub mod unistd;
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::{ptr, result, slice};
 
@@ -176,6 +177,10 @@ pub type Result<T> = result::Result<T, Errno>;
 /// * Represents all of the system's errnos, instead of just the most common
 /// ones.
 pub type Error = Errno;
+
+/// A file descriptor representing the current working directory.
+pub const AT_FDCWD: &BorrowedFd<'static> =
+    unsafe { &BorrowedFd::borrow_raw(libc::AT_FDCWD) };
 
 /// Common trait used to represent file system paths by many Nix functions.
 pub trait NixPath {

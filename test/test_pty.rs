@@ -138,9 +138,7 @@ fn open_ptty_pair() -> (PtyMaster, File) {
         }
     }
 
-    let slave = unsafe { File::from_raw_fd(slave_fd) };
-
-    (master, slave)
+    (master, File::from(slave_fd))
 }
 
 /// Test opening a master/slave PTTY pair
@@ -208,7 +206,11 @@ fn test_openpty() {
     // Writing to one should be readable on the other one
     let string = "foofoofoo\n";
     let mut buf = [0u8; 10];
-    write(pty.master, string.as_bytes()).unwrap();
+    write(
+        unsafe { &BorrowedFd::borrow_raw(pty.master) },
+        string.as_bytes(),
+    )
+    .unwrap();
     crate::read_exact(pty.slave, &mut buf);
 
     assert_eq!(&buf, string.as_bytes());
@@ -222,7 +224,11 @@ fn test_openpty() {
     let string2 = "barbarbarbar\n";
     let echoed_string2 = "barbarbarbar\r\n";
     let mut buf = [0u8; 14];
-    write(pty.slave, string2.as_bytes()).unwrap();
+    write(
+        unsafe { &BorrowedFd::borrow_raw(pty.slave) },
+        string2.as_bytes(),
+    )
+    .unwrap();
     crate::read_exact(pty.master, &mut buf);
 
     assert_eq!(&buf, echoed_string2.as_bytes());
@@ -257,7 +263,11 @@ fn test_openpty_with_termios() {
     // Writing to one should be readable on the other one
     let string = "foofoofoo\n";
     let mut buf = [0u8; 10];
-    write(pty.master, string.as_bytes()).unwrap();
+    write(
+        unsafe { &BorrowedFd::borrow_raw(pty.master) },
+        string.as_bytes(),
+    )
+    .unwrap();
     crate::read_exact(pty.slave, &mut buf);
 
     assert_eq!(&buf, string.as_bytes());
@@ -270,7 +280,11 @@ fn test_openpty_with_termios() {
     let string2 = "barbarbarbar\n";
     let echoed_string2 = "barbarbarbar\n";
     let mut buf = [0u8; 13];
-    write(pty.slave, string2.as_bytes()).unwrap();
+    write(
+        unsafe { &BorrowedFd::borrow_raw(pty.slave) },
+        string2.as_bytes(),
+    )
+    .unwrap();
     crate::read_exact(pty.master, &mut buf);
 
     assert_eq!(&buf, echoed_string2.as_bytes());
@@ -294,7 +308,11 @@ fn test_forkpty() {
     let pty = unsafe { forkpty(None, None).unwrap() };
     match pty.fork_result {
         Child => {
-            write(STDOUT_FILENO, string.as_bytes()).unwrap();
+            write(
+                unsafe { &BorrowedFd::borrow_raw(STDOUT_FILENO) },
+                string.as_bytes(),
+            )
+            .unwrap();
             pause(); // we need the child to stay alive until the parent calls read
             unsafe {
                 _exit(0);

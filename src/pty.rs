@@ -81,13 +81,15 @@ impl Drop for PtyMaster {
 
 impl io::Read for PtyMaster {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unistd::read(self.0, buf).map_err(io::Error::from)
+        unistd::read(unsafe { &BorrowedFd::borrow_raw(self.0) }, buf)
+            .map_err(io::Error::from)
     }
 }
 
 impl io::Write for PtyMaster {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        unistd::write(self.0, buf).map_err(io::Error::from)
+        unistd::write(unsafe { &BorrowedFd::borrow_raw(self.0) }, buf)
+            .map_err(io::Error::from)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -96,13 +98,15 @@ impl io::Write for PtyMaster {
 
 impl io::Read for &PtyMaster {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unistd::read(self.0, buf).map_err(io::Error::from)
+        unistd::read(unsafe { &BorrowedFd::borrow_raw(self.0) }, buf)
+            .map_err(io::Error::from)
     }
 }
 
 impl io::Write for &PtyMaster {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        unistd::write(self.0, buf).map_err(io::Error::from)
+        unistd::write(unsafe { &BorrowedFd::borrow_raw(self.0) }, buf)
+            .map_err(io::Error::from)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

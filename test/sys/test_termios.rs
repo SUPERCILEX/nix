@@ -11,7 +11,8 @@ use nix::unistd::{close, read, write};
 fn write_all(f: RawFd, buf: &[u8]) {
     let mut len = 0;
     while len < buf.len() {
-        len += write(f, &buf[len..]).unwrap();
+        len +=
+            write(unsafe { &BorrowedFd::borrow_raw(f) }, &buf[len..]).unwrap();
     }
 }
 
@@ -129,7 +130,8 @@ fn test_local_flags() {
 
     // Try to read from the master, which should not have anything as echoing was disabled.
     let mut buf = [0u8; 10];
-    let read = read(pty.master, &mut buf).unwrap_err();
+    let read = read(unsafe { &BorrowedFd::borrow_raw(pty.master) }, &mut buf)
+        .unwrap_err();
     close(pty.master).unwrap();
     close(pty.slave).unwrap();
     assert_eq!(read, Errno::EAGAIN);

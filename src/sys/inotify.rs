@@ -31,6 +31,7 @@ use cfg_if::cfg_if;
 use libc::{c_char, c_int};
 use std::ffi::{CStr, OsStr, OsString};
 use std::mem::{size_of, MaybeUninit};
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr;
@@ -195,7 +196,8 @@ impl Inotify {
         let mut events = Vec::new();
         let mut offset = 0;
 
-        let nread = read(self.fd, &mut buffer)?;
+        let nread =
+            read(unsafe { &BorrowedFd::borrow_raw(self.fd) }, &mut buffer)?;
 
         while (nread - offset) >= header_size {
             let event = unsafe {

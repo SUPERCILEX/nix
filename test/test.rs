@@ -66,6 +66,7 @@ mod test_unistd;
 
 use nix::unistd::{chdir, getcwd, read};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -75,7 +76,7 @@ fn read_exact(f: RawFd, buf: &mut [u8]) {
     while len < buf.len() {
         // get_mut would be better than split_at_mut, but it requires nightly
         let (_, remaining) = buf.split_at_mut(len);
-        len += read(f, remaining).unwrap();
+        len += read(unsafe { &BorrowedFd::borrow_raw(f) }, remaining).unwrap();
     }
 }
 

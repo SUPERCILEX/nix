@@ -6,6 +6,7 @@ use crate::sys;
 use crate::{Error, NixPath, Result};
 use cfg_if::cfg_if;
 use std::ffi;
+use std::os::unix::io::AsFd;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::ptr;
 
@@ -39,18 +40,18 @@ impl Dir {
         mode: sys::stat::Mode,
     ) -> Result<Self> {
         let fd = fcntl::open(path, oflag, mode)?;
-        Dir::from_fd(fd)
+        Dir::from_fd(fd.into_raw_fd())
     }
 
     /// Opens the given path as with `fcntl::openat`.
     pub fn openat<P: ?Sized + NixPath>(
-        dirfd: RawFd,
+        dirfd: &impl AsFd,
         path: &P,
         oflag: OFlag,
         mode: sys::stat::Mode,
     ) -> Result<Self> {
         let fd = fcntl::openat(dirfd, path, oflag, mode)?;
-        Dir::from_fd(fd)
+        Dir::from_fd(fd.into_raw_fd())
     }
 
     /// Converts from a descriptor-based object, closing the descriptor on success or failure.
@@ -240,7 +241,7 @@ impl Entry {
 
     /// Returns the bare file name of this directory entry without any other leading path component.
     pub fn file_name(&self) -> &ffi::CStr {
-        unsafe { ::std::ffi::CStr::from_ptr(self.0.d_name.as_ptr()) }
+        unsafe { ffi::CStr::from_ptr(self.0.d_name.as_ptr()) }
     }
 
     /// Returns the type of this directory entry, if known.

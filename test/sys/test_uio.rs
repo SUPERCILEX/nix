@@ -45,18 +45,16 @@ fn test_writev() {
     // FileDesc will close its filedesc (reader).
     let mut read_buf: Vec<u8> = iter::repeat(0u8).take(128 * 16).collect();
     // Blocking io, should write all data.
-    let write_res = writev(writer, &iovecs);
+    let write_res = writev(writer.as_raw_fd(), &iovecs);
     let written = write_res.expect("couldn't write");
     // Check whether we written all data
     assert_eq!(to_write.len(), written);
-    let read_res = read(reader, &mut read_buf[..]);
+    let read_res = read(&reader, &mut read_buf[..]);
     let read = read_res.expect("couldn't read");
     // Check we have read as much as we written
     assert_eq!(read, written);
     // Check equality of written and read data
     assert_eq!(&to_write, &read_buf);
-    close(writer).expect("closed writer");
-    close(reader).expect("closed reader");
 }
 
 #[test]
@@ -87,8 +85,8 @@ fn test_readv() {
     }
     let (reader, writer) = pipe().expect("couldn't create pipe");
     // Blocking io, should write all data.
-    write(writer, &to_write).expect("write failed");
-    let read = readv(reader, &mut iovecs[..]).expect("read failed");
+    write(&writer, &to_write).expect("write failed");
+    let read = readv(reader.as_raw_fd(), &mut iovecs[..]).expect("read failed");
     // Check whether we've read all data
     assert_eq!(to_write.len(), read);
     // Cccumulate data from iovecs
@@ -100,8 +98,6 @@ fn test_readv() {
     assert_eq!(read_buf.len(), to_write.len());
     // Check equality of written and read data
     assert_eq!(&read_buf, &to_write);
-    close(reader).expect("couldn't close reader");
-    close(writer).expect("couldn't close writer");
 }
 
 #[test]
@@ -236,8 +232,8 @@ fn test_process_vm_readv() {
         Parent { child } => {
             close(w).unwrap();
             // wait for child
-            read(r, &mut [0u8]).unwrap();
-            close(r).unwrap();
+            read(&r, &mut [0u8]).unwrap();
+            drop(r);
 
             let ptr = vector.as_ptr() as usize;
             let remote_iov = RemoteIoVec { base: ptr, len: 5 };
@@ -260,8 +256,8 @@ fn test_process_vm_readv() {
             for i in &mut vector {
                 *i += 1;
             }
-            let _ = write(w, b"\0");
-            let _ = close(w);
+            let _ = write(&w, b"\0");
+            drop(w);
             loop {
                 pause();
             }

@@ -1,9 +1,11 @@
 use crate::errno::Errno;
 use libc::{self, c_char, c_int, c_uint, size_t, ssize_t};
 use std::ffi::OsString;
-#[cfg(not(target_os = "redox"))]
-use std::os::raw;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::io::AsFd;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::OwnedFd;
 use std::os::unix::io::RawFd;
 
 #[cfg(feature = "fs")]
@@ -193,51 +195,61 @@ feature! {
 
 // The conversion is not identical on all operating systems.
 #[allow(clippy::useless_conversion)]
-pub fn open<P: ?Sized + NixPath>(path: &P, oflag: OFlag, mode: Mode) -> Result<RawFd> {
-    let fd = path.with_nix_path(|cstr| {
-        unsafe { libc::open(cstr.as_ptr(), oflag.bits(), mode.bits() as c_uint) }
+pub fn open(
+    path: &(impl ?Sized + NixPath),
+    oflag: OFlag,
+    mode: Mode,
+) -> Result<OwnedFd> {
+    let fd = path.with_nix_path(|cstr| unsafe {
+        libc::open(cstr.as_ptr(), oflag.bits(), mode.bits() as c_uint)
     })?;
 
-    Errno::result(fd)
+    Errno::result(fd).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 // The conversion is not identical on all operating systems.
 #[allow(clippy::useless_conversion)]
 #[cfg(not(target_os = "redox"))]
-pub fn openat<P: ?Sized + NixPath>(
-    dirfd: RawFd,
-    path: &P,
+pub fn openat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     oflag: OFlag,
     mode: Mode,
-) -> Result<RawFd> {
-    let fd = path.with_nix_path(|cstr| {
-        unsafe { libc::openat(dirfd, cstr.as_ptr(), oflag.bits(), mode.bits() as c_uint) }
+) -> Result<OwnedFd> {
+    let fd = path.with_nix_path(|cstr| unsafe {
+        libc::openat(
+            dirfd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            oflag.bits(),
+            mode.bits() as c_uint,
+        )
     })?;
-    Errno::result(fd)
+
+    Errno::result(fd).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(not(target_os = "redox"))]
-pub fn renameat<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
-    old_dirfd: Option<RawFd>,
-    old_path: &P1,
-    new_dirfd: Option<RawFd>,
-    new_path: &P2,
+pub fn renameat(
+    old_dirfd: &impl AsFd,
+    old_path: &(impl ?Sized + NixPath),
+    new_dirfd: &impl AsFd,
+    new_path: &(impl ?Sized + NixPath),
 ) -> Result<()> {
     let res = old_path.with_nix_path(|old_cstr| {
         new_path.with_nix_path(|new_cstr| unsafe {
             libc::renameat(
-                at_rawfd(old_dirfd),
+                old_dirfd.as_fd().as_raw_fd(),
                 old_cstr.as_ptr(),
-                at_rawfd(new_dirfd),
+                new_dirfd.as_fd().as_raw_fd(),
                 new_cstr.as_ptr(),
             )
         })
     })??;
     Errno::result(res).map(drop)
-}
+    }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu",))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[cfg(feature = "fs")]
 libc_bitflags! {
     #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
@@ -250,23 +262,20 @@ libc_bitflags! {
 
 feature! {
 #![feature = "fs"]
-#[cfg(all(
-    target_os = "linux",
-    target_env = "gnu",
-))]
-pub fn renameat2<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
-    old_dirfd: Option<RawFd>,
-    old_path: &P1,
-    new_dirfd: Option<RawFd>,
-    new_path: &P2,
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn renameat2(
+    old_dirfd: &impl AsFd,
+    old_path: &(impl ?Sized + NixPath),
+    new_dirfd: &impl AsFd,
+    new_path: &(impl ?Sized + NixPath),
     flags: RenameFlags,
 ) -> Result<()> {
     let res = old_path.with_nix_path(|old_cstr| {
         new_path.with_nix_path(|new_cstr| unsafe {
             libc::renameat2(
-                at_rawfd(old_dirfd),
+                old_dirfd.as_fd().as_raw_fd(),
                 old_cstr.as_ptr(),
-                at_rawfd(new_dirfd),
+                new_dirfd.as_fd().as_raw_fd(),
                 new_cstr.as_ptr(),
                 flags.bits(),
             )
@@ -278,21 +287,21 @@ pub fn renameat2<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
 fn wrap_readlink_result(mut v: Vec<u8>, len: ssize_t) -> Result<OsString> {
     unsafe { v.set_len(len as usize) }
     v.shrink_to_fit();
-    Ok(OsString::from_vec(v.to_vec()))
+    Ok(OsString::from_vec(v))
 }
 
-fn readlink_maybe_at<P: ?Sized + NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
+fn readlink_maybe_at(
+    dirfd: Option<&impl AsFd>,
+    path: &(impl ?Sized + NixPath),
     v: &mut Vec<u8>,
-) -> Result<libc::ssize_t> {
+) -> Result<ssize_t> {
     path.with_nix_path(|cstr| unsafe {
         match dirfd {
             #[cfg(target_os = "redox")]
             Some(_) => unreachable!(),
             #[cfg(not(target_os = "redox"))]
             Some(dirfd) => libc::readlinkat(
-                dirfd,
+                dirfd.as_fd().as_raw_fd(),
                 cstr.as_ptr(),
                 v.as_mut_ptr() as *mut c_char,
                 v.capacity() as size_t,
@@ -306,75 +315,98 @@ fn readlink_maybe_at<P: ?Sized + NixPath>(
     })
 }
 
-fn inner_readlink<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P) -> Result<OsString> {
+fn inner_readlink(
+    dirfd: Option<&impl AsFd>,
+    path: &(impl ?Sized + NixPath),
+) -> Result<OsString> {
     let mut v = Vec::with_capacity(libc::PATH_MAX as usize);
-    // simple case: result is strictly less than `PATH_MAX`
-    let res = readlink_maybe_at(dirfd, path, &mut v)?;
-    let len = Errno::result(res)?;
-    debug_assert!(len >= 0);
-    if (len as usize) < v.capacity() {
-        return wrap_readlink_result(v, res);
-    }
-    // Uh oh, the result is too long...
-    // Let's try to ask lstat how many bytes to allocate.
-    let reported_size = match dirfd {
-        #[cfg(target_os = "redox")]
-        Some(_) => unreachable!(),
-        #[cfg(any(target_os = "android", target_os = "linux"))]
-        Some(dirfd) => {
-            let flags = if path.is_empty() { AtFlags::AT_EMPTY_PATH } else { AtFlags::empty() };
-            super::sys::stat::fstatat(dirfd, path, flags | AtFlags::AT_SYMLINK_NOFOLLOW)
-        },
-        #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "redox")))]
-        Some(dirfd) => super::sys::stat::fstatat(dirfd, path, AtFlags::AT_SYMLINK_NOFOLLOW),
-        None => super::sys::stat::lstat(path)
-    }
-        .map(|x| x.st_size)
-        .unwrap_or(0);
-    let mut try_size = if reported_size > 0 {
-        // Note: even if `lstat`'s apparently valid answer turns out to be
-        // wrong, we will still read the full symlink no matter what.
-        reported_size as usize + 1
-    } else {
-        // If lstat doesn't cooperate, or reports an error, be a little less
-        // precise.
-        (libc::PATH_MAX as usize).max(128) << 1
-    };
-    loop {
-        v.reserve_exact(try_size);
+
+    {
+        // simple case: result is strictly less than `PATH_MAX`
         let res = readlink_maybe_at(dirfd, path, &mut v)?;
         let len = Errno::result(res)?;
         debug_assert!(len >= 0);
         if (len as usize) < v.capacity() {
-            break wrap_readlink_result(v, res);
-        } else {
-            // Ugh! Still not big enough!
-            match try_size.checked_shl(1) {
-                Some(next_size) => try_size = next_size,
-                // It's absurd that this would happen, but handle it sanely
-                // anyway.
-                None => break Err(Errno::ENAMETOOLONG),
+            return wrap_readlink_result(v, res);
+        }
+    }
+
+    // Uh oh, the result is too long...
+    // Let's try to ask lstat how many bytes to allocate.
+    let mut try_size = {
+        let reported_size = match dirfd {
+            #[cfg(target_os = "redox")]
+            Some(_) => unreachable!(),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            Some(dirfd) => {
+                let flags = if path.is_empty() {
+                    AtFlags::AT_EMPTY_PATH
+                } else {
+                    AtFlags::empty()
+                };
+                super::sys::stat::fstatat(
+                    dirfd,
+                    path,
+                    flags | AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
             }
+            #[cfg(not(any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "redox"
+            )))]
+            Some(dirfd) => super::sys::stat::fstatat(
+                dirfd,
+                path,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ),
+            None => super::sys::stat::lstat(path),
+        }
+        .map(|x| x.st_size)
+        .unwrap_or(0);
+
+        if reported_size > 0 {
+            // Note: even if `lstat`'s apparently valid answer turns out to be
+            // wrong, we will still read the full symlink no matter what.
+            reported_size as usize + 1
+        } else {
+            // If lstat doesn't cooperate, or reports an error, be a little less
+            // precise.
+            (libc::PATH_MAX as usize).max(128) << 1
+        }
+    };
+
+    loop {
+        {
+            v.reserve_exact(try_size);
+            let res = readlink_maybe_at(dirfd, path, &mut v)?;
+            let len = Errno::result(res)?;
+            debug_assert!(len >= 0);
+            if (len as usize) < v.capacity() {
+                return wrap_readlink_result(v, res);
+            }
+        }
+
+        // Ugh! Still not big enough!
+        match try_size.checked_shl(1) {
+            Some(next_size) => try_size = next_size,
+            // It's absurd that this would happen, but handle it sanely
+            // anyway.
+            None => break Err(Errno::ENAMETOOLONG),
         }
     }
 }
 
-pub fn readlink<P: ?Sized + NixPath>(path: &P) -> Result<OsString> {
-    inner_readlink(None, path)
+pub fn readlink(path: &(impl ?Sized + NixPath)) -> Result<OsString> {
+    inner_readlink(None::<&OwnedFd>, path)
 }
 
 #[cfg(not(target_os = "redox"))]
-pub fn readlinkat<P: ?Sized + NixPath>(dirfd: RawFd, path: &P) -> Result<OsString> {
+pub fn readlinkat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
+) -> Result<OsString> {
     inner_readlink(Some(dirfd), path)
-}
-
-/// Computes the raw fd consumed by a function of the form `*at`.
-#[cfg(not(target_os = "redox"))]
-pub(crate) fn at_rawfd(fd: Option<RawFd>) -> raw::c_int {
-    match fd {
-        None => libc::AT_FDCWD,
-        Some(fd) => fd,
-    }
 }
 }
 
@@ -566,9 +598,9 @@ feature! {
 /// returned.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn copy_file_range(
-    fd_in: RawFd,
+    fd_in: &impl AsFd,
     off_in: Option<&mut libc::loff_t>,
-    fd_out: RawFd,
+    fd_out: &impl AsFd,
     off_out: Option<&mut libc::loff_t>,
     len: usize,
 ) -> Result<usize> {
@@ -580,11 +612,10 @@ pub fn copy_file_range(
         .unwrap_or(ptr::null_mut());
 
     let ret = unsafe {
-        libc::syscall(
-            libc::SYS_copy_file_range,
-            fd_in,
+        libc::copy_file_range(
+            fd_in.as_fd().as_raw_fd(),
             off_in,
-            fd_out,
+            fd_out.as_fd().as_raw_fd(),
             off_out,
             len,
             0,
@@ -595,9 +626,9 @@ pub fn copy_file_range(
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn splice(
-    fd_in: RawFd,
+    fd_in: &impl AsFd,
     off_in: Option<&mut libc::loff_t>,
-    fd_out: RawFd,
+    fd_out: &impl AsFd,
     off_out: Option<&mut libc::loff_t>,
     len: usize,
     flags: SpliceFFlags,
@@ -609,26 +640,46 @@ pub fn splice(
         .map(|offset| offset as *mut libc::loff_t)
         .unwrap_or(ptr::null_mut());
 
-    let ret = unsafe { libc::splice(fd_in, off_in, fd_out, off_out, len, flags.bits()) };
+    let ret = unsafe {
+        libc::splice(
+            fd_in.as_fd().as_raw_fd(),
+            off_in,
+            fd_out.as_fd().as_raw_fd(),
+            off_out,
+            len,
+            flags.bits(),
+        )
+    };
     Errno::result(ret).map(|r| r as usize)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn tee(fd_in: RawFd, fd_out: RawFd, len: usize, flags: SpliceFFlags) -> Result<usize> {
-    let ret = unsafe { libc::tee(fd_in, fd_out, len, flags.bits()) };
+pub fn tee(
+    fd_in: &impl AsFd,
+    fd_out: &impl AsFd,
+    len: usize,
+    flags: SpliceFFlags,
+) -> Result<usize> {
+    let ret = unsafe {
+        libc::tee(
+            fd_in.as_fd().as_raw_fd(),
+            fd_out.as_fd().as_raw_fd(),
+            len,
+            flags.bits(),
+        )
+    };
     Errno::result(ret).map(|r| r as usize)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn vmsplice(
-    fd: RawFd,
+    fd: &impl AsFd,
     iov: &[std::io::IoSlice<'_>],
-    flags: SpliceFFlags
-    ) -> Result<usize>
-{
+    flags: SpliceFFlags,
+) -> Result<usize> {
     let ret = unsafe {
         libc::vmsplice(
-            fd,
+            fd.as_fd().as_raw_fd(),
             iov.as_ptr() as *const libc::iovec,
             iov.len(),
             flags.bits(),
@@ -681,12 +732,14 @@ feature! {
 #[cfg(any(target_os = "linux"))]
 #[cfg(feature = "fs")]
 pub fn fallocate(
-    fd: RawFd,
+    fd: &impl AsFd,
     mode: FallocateFlags,
     offset: libc::off_t,
     len: libc::off_t,
 ) -> Result<()> {
-    let res = unsafe { libc::fallocate(fd, mode.bits(), offset, len) };
+    let res = unsafe {
+        libc::fallocate(fd.as_fd().as_raw_fd(), mode.bits(), offset, len)
+    };
     Errno::result(res).map(drop)
 }
 
@@ -739,30 +792,38 @@ impl SpacectlRange {
 #[cfg_attr(not(fbsd14), doc = " ```no_run")]
 /// # use std::io::Write;
 /// # use std::os::unix::fs::FileExt;
-/// # use std::os::unix::io::AsRawFd;
 /// # use nix::fcntl::*;
 /// # use tempfile::tempfile;
+///
 /// const INITIAL: &[u8] = b"0123456789abcdef";
 /// let mut f = tempfile().unwrap();
 /// f.write_all(INITIAL).unwrap();
 /// let mut range = SpacectlRange(3, 6);
 /// while (!range.is_empty()) {
-///     range = fspacectl(f.as_raw_fd(), range).unwrap();
+///     range = fspacectl(f, range).unwrap();
 /// }
 /// let mut buf = vec![0; INITIAL.len()];
 /// f.read_exact_at(&mut buf, 0).unwrap();
 /// assert_eq!(buf, b"012\0\0\0\0\0\09abcdef");
 /// ```
 #[cfg(target_os = "freebsd")]
-pub fn fspacectl(fd: RawFd, range: SpacectlRange) -> Result<SpacectlRange> {
-    let mut rqsr = libc::spacectl_range{r_offset: range.0, r_len: range.1};
-    let res = unsafe { libc::fspacectl(
-            fd,
+pub fn fspacectl(
+    fd: &impl AsFd,
+    range: SpacectlRange,
+) -> Result<SpacectlRange> {
+    let mut rqsr = libc::spacectl_range {
+        r_offset: range.0,
+        r_len: range.1,
+    };
+    let res = unsafe {
+        libc::fspacectl(
+            fd.as_fd().as_raw_fd(),
             libc::SPACECTL_DEALLOC, // Only one command is supported ATM
             &rqsr,
-            0,                      // No flags are currently supported
-            &mut rqsr
-    )};
+            0, // No flags are currently supported
+            &mut rqsr,
+        )
+    };
     Errno::result(res).map(|_| SpacectlRange(rqsr.r_offset, rqsr.r_len))
 }
 
@@ -785,30 +846,37 @@ pub fn fspacectl(fd: RawFd, range: SpacectlRange) -> Result<SpacectlRange> {
 #[cfg_attr(not(fbsd14), doc = " ```no_run")]
 /// # use std::io::Write;
 /// # use std::os::unix::fs::FileExt;
-/// # use std::os::unix::io::AsRawFd;
 /// # use nix::fcntl::*;
 /// # use tempfile::tempfile;
+///
 /// const INITIAL: &[u8] = b"0123456789abcdef";
 /// let mut f = tempfile().unwrap();
 /// f.write_all(INITIAL).unwrap();
-/// fspacectl_all(f.as_raw_fd(), 3, 6).unwrap();
+/// fspacectl_all(f, 3, 6).unwrap();
 /// let mut buf = vec![0; INITIAL.len()];
 /// f.read_exact_at(&mut buf, 0).unwrap();
 /// assert_eq!(buf, b"012\0\0\0\0\0\09abcdef");
 /// ```
 #[cfg(target_os = "freebsd")]
-pub fn fspacectl_all(fd: RawFd, offset: libc::off_t, len: libc::off_t)
-    -> Result<()>
-{
-    let mut rqsr = libc::spacectl_range{r_offset: offset, r_len: len};
+pub fn fspacectl_all(
+    fd: &impl AsFd,
+    offset: libc::off_t,
+    len: libc::off_t,
+) -> Result<()> {
+    let mut rqsr = libc::spacectl_range {
+        r_offset: offset,
+        r_len: len,
+    };
     while rqsr.r_len > 0 {
-        let res = unsafe { libc::fspacectl(
-                fd,
+        let res = unsafe {
+            libc::fspacectl(
+                fd.as_fd().as_raw_fd(),
                 libc::SPACECTL_DEALLOC, // Only one command is supported ATM
                 &rqsr,
-                0,                      // No flags are currently supported
-                &mut rqsr
-        )};
+                0, // No flags are currently supported
+                &mut rqsr,
+            )
+        };
         Errno::result(res)?;
     }
     Ok(())
@@ -825,8 +893,9 @@ pub fn fspacectl_all(fd: RawFd, offset: libc::off_t, len: libc::off_t)
 ))]
 mod posix_fadvise {
     use crate::errno::Errno;
-    use std::os::unix::io::RawFd;
     use crate::Result;
+    use std::os::unix::io::AsFd;
+    use std::os::unix::io::AsRawFd;
 
     #[cfg(feature = "fs")]
     libc_enum! {
@@ -846,19 +915,26 @@ mod posix_fadvise {
     feature! {
     #![feature = "fs"]
     pub fn posix_fadvise(
-        fd: RawFd,
+        fd: &impl AsFd,
         offset: libc::off_t,
         len: libc::off_t,
         advice: PosixFadviseAdvice,
     ) -> Result<()> {
-        let res = unsafe { libc::posix_fadvise(fd, offset, len, advice as libc::c_int) };
+        let res = unsafe {
+            libc::posix_fadvise(
+                fd.as_fd().as_raw_fd(),
+                offset,
+                len,
+                advice as libc::c_int,
+            )
+        };
 
         if res == 0 {
             Ok(())
         } else {
             Err(Errno::from_i32(res))
         }
-    }
+        }
     }
 }
 
@@ -871,8 +947,13 @@ mod posix_fadvise {
     target_os = "wasi",
     target_os = "freebsd"
 ))]
-pub fn posix_fallocate(fd: RawFd, offset: libc::off_t, len: libc::off_t) -> Result<()> {
-    let res = unsafe { libc::posix_fallocate(fd, offset, len) };
+pub fn posix_fallocate(
+    fd: &impl AsFd,
+    offset: libc::off_t,
+    len: libc::off_t,
+) -> Result<()> {
+    let res =
+        unsafe { libc::posix_fallocate(fd.as_fd().as_raw_fd(), offset, len) };
     match Errno::result(res) {
         Err(err) => Err(err),
         Ok(0) => Ok(()),

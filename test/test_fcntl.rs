@@ -42,7 +42,7 @@ fn test_openat() {
         open(tmp.path().parent().unwrap(), OFlag::empty(), Mode::empty())
             .unwrap();
     let fd = openat(
-        dirfd,
+        &dirfd,
         tmp.path().file_name().unwrap(),
         OFlag::O_RDONLY,
         Mode::empty(),
@@ -50,11 +50,8 @@ fn test_openat() {
     .unwrap();
 
     let mut buf = [0u8; 1024];
-    assert_eq!(4, read(fd, &mut buf).unwrap());
+    assert_eq!(4, read(&fd, &mut buf).unwrap());
     assert_eq!(CONTENTS, &buf[0..4]);
-
-    close(fd).unwrap();
-    close(dirfd).unwrap();
 }
 
 #[test]
@@ -68,13 +65,11 @@ fn test_renameat() {
     let new_dir = tempfile::tempdir().unwrap();
     let new_dirfd =
         open(new_dir.path(), OFlag::empty(), Mode::empty()).unwrap();
-    renameat(Some(old_dirfd), "old", Some(new_dirfd), "new").unwrap();
+    renameat(&old_dirfd, "old", &new_dirfd, "new").unwrap();
     assert_eq!(
-        renameat(Some(old_dirfd), "old", Some(new_dirfd), "new").unwrap_err(),
+        renameat(&old_dirfd, "old", &new_dirfd, "new").unwrap_err(),
         Errno::ENOENT
     );
-    close(old_dirfd).unwrap();
-    close(new_dirfd).unwrap();
     assert!(new_dir.path().join("new").exists());
 }
 
@@ -98,23 +93,11 @@ fn test_renameat2_behaves_like_renameat_with_no_flags() {
     let new_dir = tempfile::tempdir().unwrap();
     let new_dirfd =
         open(new_dir.path(), OFlag::empty(), Mode::empty()).unwrap();
-    renameat2(
-        Some(old_dirfd),
-        "old",
-        Some(new_dirfd),
-        "new",
-        RenameFlags::empty(),
-    )
-    .unwrap();
+    renameat2(&old_dirfd, "old", &new_dirfd, "new", RenameFlags::empty())
+        .unwrap();
     assert_eq!(
-        renameat2(
-            Some(old_dirfd),
-            "old",
-            Some(new_dirfd),
-            "new",
-            RenameFlags::empty()
-        )
-        .unwrap_err(),
+        renameat2(&old_dirfd, "old", &new_dirfd, "new", RenameFlags::empty())
+            .unwrap_err(),
         Errno::ENOENT
     );
     close(old_dirfd).unwrap();
@@ -151,9 +134,9 @@ fn test_renameat2_exchange() {
         new_f.write_all(b"new").unwrap();
     }
     renameat2(
-        Some(old_dirfd),
+        &old_dirfd,
         "old",
-        Some(new_dirfd),
+        &new_dirfd,
         "new",
         RenameFlags::RENAME_EXCHANGE,
     )
@@ -194,9 +177,9 @@ fn test_renameat2_noreplace() {
     File::create(new_path).unwrap();
     assert_eq!(
         renameat2(
-            Some(old_dirfd),
+            &old_dirfd,
             "old",
-            Some(new_dirfd),
+            &new_dirfd,
             "new",
             RenameFlags::RENAME_NOREPLACE
         )
@@ -222,7 +205,7 @@ fn test_readlink() {
 
     assert_eq!(readlink(&dst).unwrap().to_str().unwrap(), expected_dir);
     assert_eq!(
-        readlinkat(dirfd, "b").unwrap().to_str().unwrap(),
+        readlinkat(&dirfd, "b").unwrap().to_str().unwrap(),
         expected_dir
     );
 }
@@ -235,7 +218,7 @@ mod linux_android {
     use std::os::unix::prelude::*;
 
     use nix::fcntl::*;
-    use nix::unistd::{close, pipe, read, write};
+    use nix::unistd::{pipe, read, write};
 
     use tempfile::tempfile;
     #[cfg(any(target_os = "linux"))]
@@ -262,14 +245,7 @@ mod linux_android {
         tmp1.flush().unwrap();
 
         let mut from_offset: i64 = 3;
-        copy_file_range(
-            tmp1.as_raw_fd(),
-            Some(&mut from_offset),
-            tmp2.as_raw_fd(),
-            None,
-            3,
-        )
-        .unwrap();
+        copy_file_range(&tmp1, Some(&mut from_offset), &tmp2, None, 3).unwrap();
 
         let mut res: String = String::new();
         tmp2.seek(SeekFrom::Start(0)).unwrap();
@@ -288,9 +264,9 @@ mod linux_android {
         let (rd, wr) = pipe().unwrap();
         let mut offset: loff_t = 5;
         let res = splice(
-            tmp.as_raw_fd(),
+            &tmp,
             Some(&mut offset),
-            wr,
+            &wr,
             None,
             2,
             SpliceFFlags::empty(),
@@ -300,12 +276,9 @@ mod linux_android {
         assert_eq!(2, res);
 
         let mut buf = [0u8; 1024];
-        assert_eq!(2, read(rd, &mut buf).unwrap());
+        assert_eq!(2, read(&rd, &mut buf).unwrap());
         assert_eq!(b"f1", &buf[0..2]);
         assert_eq!(7, offset);
-
-        close(rd).unwrap();
-        close(wr).unwrap();
     }
 
     #[test]
@@ -313,25 +286,20 @@ mod linux_android {
         let (rd1, wr1) = pipe().unwrap();
         let (rd2, wr2) = pipe().unwrap();
 
-        write(wr1, b"abc").unwrap();
-        let res = tee(rd1, wr2, 2, SpliceFFlags::empty()).unwrap();
+        write(&wr1, b"abc").unwrap();
+        let res = tee(&rd1, &wr2, 2, SpliceFFlags::empty()).unwrap();
 
         assert_eq!(2, res);
 
         let mut buf = [0u8; 1024];
 
         // Check the tee'd bytes are at rd2.
-        assert_eq!(2, read(rd2, &mut buf).unwrap());
+        assert_eq!(2, read(&rd2, &mut buf).unwrap());
         assert_eq!(b"ab", &buf[0..2]);
 
         // Check all the bytes are still at rd1.
-        assert_eq!(3, read(rd1, &mut buf).unwrap());
+        assert_eq!(3, read(&rd1, &mut buf).unwrap());
         assert_eq!(b"abc", &buf[0..3]);
-
-        close(rd1).unwrap();
-        close(wr1).unwrap();
-        close(rd2).unwrap();
-        close(wr2).unwrap();
     }
 
     #[test]
@@ -342,17 +310,14 @@ mod linux_android {
         let buf2 = b"defghi";
         let iovecs = vec![IoSlice::new(&buf1[0..3]), IoSlice::new(&buf2[0..3])];
 
-        let res = vmsplice(wr, &iovecs[..], SpliceFFlags::empty()).unwrap();
+        let res = vmsplice(&wr, &iovecs[..], SpliceFFlags::empty()).unwrap();
 
         assert_eq!(6, res);
 
         // Check the bytes can be read at rd.
         let mut buf = [0u8; 32];
-        assert_eq!(6, read(rd, &mut buf).unwrap());
+        assert_eq!(6, read(&rd, &mut buf).unwrap());
         assert_eq!(b"abcdef", &buf[0..6]);
-
-        close(rd).unwrap();
-        close(wr).unwrap();
     }
 
     #[cfg(any(target_os = "linux"))]
@@ -360,7 +325,7 @@ mod linux_android {
     fn test_fallocate() {
         let tmp = NamedTempFile::new().unwrap();
 
-        let fd = tmp.as_raw_fd();
+        let fd = unsafe { &BorrowedFd::borrow_raw(tmp.as_raw_fd()) };
         fallocate(fd, FallocateFlags::empty(), 0, 100).unwrap();
 
         // Check if we read exactly 100 bytes
@@ -382,7 +347,7 @@ mod linux_android {
 
         let tmp = NamedTempFile::new().unwrap();
 
-        let fd = tmp.as_raw_fd();
+        let fd = unsafe { &BorrowedFd::borrow_raw(tmp.as_raw_fd()) };
         let statfs = nix::sys::statfs::fstatfs(&tmp).unwrap();
         if statfs.filesystem_type() == nix::sys::statfs::OVERLAYFS_SUPER_MAGIC {
             // OverlayFS is a union file system.  It returns one inode value in
@@ -400,14 +365,15 @@ mod linux_android {
         flock.l_start = 0;
         flock.l_len = 0;
         flock.l_pid = 0;
-        fcntl(fd, FcntlArg::F_OFD_SETLKW(&flock)).expect("write lock failed");
+        fcntl(fd.as_raw_fd(), F_OFD_SETLKW(&flock)).expect("write lock failed");
         assert_eq!(
             Some(("OFDLCK".to_string(), "WRITE".to_string())),
             lock_info(inode)
         );
 
         flock.l_type = libc::F_UNLCK as libc::c_short;
-        fcntl(fd, FcntlArg::F_OFD_SETLKW(&flock)).expect("write unlock failed");
+        fcntl(fd.as_raw_fd(), F_OFD_SETLKW(&flock))
+            .expect("write unlock failed");
         assert_eq!(None, lock_info(inode));
     }
 
@@ -420,7 +386,7 @@ mod linux_android {
 
         let tmp = NamedTempFile::new().unwrap();
 
-        let fd = tmp.as_raw_fd();
+        let fd = unsafe { &BorrowedFd::borrow_raw(tmp.as_raw_fd()) };
         let statfs = nix::sys::statfs::fstatfs(&tmp).unwrap();
         if statfs.filesystem_type() == nix::sys::statfs::OVERLAYFS_SUPER_MAGIC {
             // OverlayFS is a union file system.  It returns one inode value in
@@ -438,14 +404,15 @@ mod linux_android {
         flock.l_start = 0;
         flock.l_len = 0;
         flock.l_pid = 0;
-        fcntl(fd, FcntlArg::F_OFD_SETLKW(&flock)).expect("read lock failed");
+        fcntl(fd.as_raw_fd(), F_OFD_SETLKW(&flock)).expect("read lock failed");
         assert_eq!(
             Some(("OFDLCK".to_string(), "READ".to_string())),
             lock_info(inode)
         );
 
         flock.l_type = libc::F_UNLCK as libc::c_short;
-        fcntl(fd, FcntlArg::F_OFD_SETLKW(&flock)).expect("read unlock failed");
+        fcntl(fd.as_raw_fd(), F_OFD_SETLKW(&flock))
+            .expect("read unlock failed");
         assert_eq!(None, lock_info(inode));
     }
 
@@ -481,17 +448,17 @@ mod linux_android {
     target_os = "freebsd"
 ))]
 mod test_posix_fadvise {
-
     use nix::errno::Errno;
     use nix::fcntl::*;
     use nix::unistd::pipe;
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::fd::BorrowedFd;
+    use std::os::unix::io::AsRawFd;
     use tempfile::NamedTempFile;
 
     #[test]
     fn test_success() {
         let tmp = NamedTempFile::new().unwrap();
-        let fd = tmp.as_raw_fd();
+        let fd = unsafe { &BorrowedFd::borrow_raw(tmp.as_raw_fd()) };
         posix_fadvise(fd, 0, 100, PosixFadviseAdvice::POSIX_FADV_WILLNEED)
             .expect("posix_fadvise failed");
     }
@@ -499,12 +466,8 @@ mod test_posix_fadvise {
     #[test]
     fn test_errno() {
         let (rd, _wr) = pipe().unwrap();
-        let res = posix_fadvise(
-            rd as RawFd,
-            0,
-            100,
-            PosixFadviseAdvice::POSIX_FADV_WILLNEED,
-        );
+        let res =
+            posix_fadvise(&rd, 0, 100, PosixFadviseAdvice::POSIX_FADV_WILLNEED);
         assert_eq!(res, Err(Errno::ESPIPE));
     }
 }
@@ -523,18 +486,19 @@ mod test_posix_fallocate {
     use nix::errno::Errno;
     use nix::fcntl::*;
     use nix::unistd::pipe;
-    use std::{
-        io::Read,
-        os::unix::io::{AsRawFd, RawFd},
-    };
+    use std::os::fd::BorrowedFd;
+    use std::{io::Read, os::unix::io::AsRawFd};
     use tempfile::NamedTempFile;
 
     #[test]
     fn success() {
         const LEN: usize = 100;
         let mut tmp = NamedTempFile::new().unwrap();
-        let fd = tmp.as_raw_fd();
-        let res = posix_fallocate(fd, 0, LEN as libc::off_t);
+        let res = posix_fallocate(
+            unsafe { &BorrowedFd::borrow_raw(tmp.as_raw_fd()) },
+            0,
+            LEN as libc::off_t,
+        );
         match res {
             Ok(_) => {
                 let mut data = [1u8; LEN];
@@ -556,7 +520,7 @@ mod test_posix_fallocate {
     #[test]
     fn errno() {
         let (rd, _wr) = pipe().unwrap();
-        let err = posix_fallocate(rd as RawFd, 0, 100).unwrap_err();
+        let err = posix_fallocate(&rd, 0, 100).unwrap_err();
         match err {
             Errno::EINVAL | Errno::ENODEV | Errno::ESPIPE | Errno::EBADF => (),
             errno => panic!("unexpected errno {}", errno,),

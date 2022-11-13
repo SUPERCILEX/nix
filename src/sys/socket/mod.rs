@@ -1426,13 +1426,15 @@ impl<'a> ControlMessage<'a> {
 /// # use nix::sys::socket::*;
 /// # use nix::unistd::pipe;
 /// # use std::io::IoSlice;
+/// # use std::os::fd::AsRawFd;
+///
 /// let (fd1, fd2) = socketpair(AddressFamily::Unix, SockType::Stream, None,
 ///     SockFlag::empty())
 ///     .unwrap();
 /// let (r, w) = pipe().unwrap();
 ///
 /// let iov = [IoSlice::new(b"hello")];
-/// let fds = [r];
+/// let fds = [r.as_raw_fd()];
 /// let cmsg = ControlMessage::ScmRights(&fds);
 /// sendmsg::<()>(fd1, &iov, &[cmsg], MsgFlags::empty(), None).unwrap();
 /// ```
@@ -1441,14 +1443,16 @@ impl<'a> ControlMessage<'a> {
 /// # use nix::sys::socket::*;
 /// # use nix::unistd::pipe;
 /// # use std::io::IoSlice;
+/// # use std::os::fd::AsRawFd;
 /// # use std::str::FromStr;
+///
 /// let localhost = SockaddrIn::from_str("1.2.3.4:8080").unwrap();
 /// let fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(),
 ///     None).unwrap();
 /// let (r, w) = pipe().unwrap();
 ///
 /// let iov = [IoSlice::new(b"hello")];
-/// let fds = [r];
+/// let fds = [r.as_raw_fd()];
 /// let cmsg = ControlMessage::ScmRights(&fds);
 /// sendmsg(fd, &iov, &[cmsg], MsgFlags::empty(), Some(&localhost)).unwrap();
 /// ```
@@ -2207,14 +2211,14 @@ pub fn recvfrom<T: SockaddrLike>(
             buf.as_ptr() as *mut c_void,
             buf.len() as size_t,
             0,
-            addr.as_mut_ptr() as *mut libc::sockaddr,
+            addr.as_mut_ptr() as *mut sockaddr,
             &mut len as *mut socklen_t,
         ))? as usize;
 
         Ok((
             ret,
             T::from_raw(
-                addr.assume_init().as_ptr() as *const libc::sockaddr,
+                addr.assume_init().as_ptr() as *const sockaddr,
                 Some(len),
             ),
         ))
@@ -2322,11 +2326,8 @@ pub fn getpeername<T: SockaddrLike>(fd: RawFd) -> Result<T> {
         let mut addr = mem::MaybeUninit::<T>::uninit();
         let mut len = T::size();
 
-        let ret = libc::getpeername(
-            fd,
-            addr.as_mut_ptr() as *mut libc::sockaddr,
-            &mut len,
-        );
+        let ret =
+            libc::getpeername(fd, addr.as_mut_ptr() as *mut sockaddr, &mut len);
 
         Errno::result(ret)?;
 
@@ -2342,11 +2343,8 @@ pub fn getsockname<T: SockaddrLike>(fd: RawFd) -> Result<T> {
         let mut addr = mem::MaybeUninit::<T>::uninit();
         let mut len = T::size();
 
-        let ret = libc::getsockname(
-            fd,
-            addr.as_mut_ptr() as *mut libc::sockaddr,
-            &mut len,
-        );
+        let ret =
+            libc::getsockname(fd, addr.as_mut_ptr() as *mut sockaddr, &mut len);
 
         Errno::result(ret)?;
 

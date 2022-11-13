@@ -3,9 +3,9 @@
 use crate::errno::{self, Errno};
 #[cfg(not(target_os = "redox"))]
 #[cfg(feature = "fs")]
-use crate::fcntl::{at_rawfd, AtFlags};
+use crate::fcntl::AtFlags;
 #[cfg(feature = "fs")]
-use crate::fcntl::{fcntl, FcntlArg::F_SETFD, FdFlag, OFlag};
+use crate::fcntl::OFlag;
 #[cfg(all(
     feature = "fs",
     any(
@@ -31,10 +31,13 @@ use std::convert::Infallible;
 use std::ffi::{CStr, OsString};
 #[cfg(not(target_os = "redox"))]
 use std::ffi::{CString, OsStr};
+use std::os::fd::IntoRawFd;
 #[cfg(not(target_os = "redox"))]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::io::AsFd;
 use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::{fmt, mem, ptr};
 
@@ -252,19 +255,30 @@ impl ForkResult {
 /// return value of this function.  As an example:
 ///
 /// ```
-/// use nix::{sys::wait::waitpid,unistd::{fork, ForkResult, write}};
+/// use nix::{
+///     sys::wait::waitpid,
+///     unistd::{fork, write, ForkResult},
+/// };
+/// use std::os::fd::BorrowedFd;
 ///
-/// match unsafe{fork()} {
-///    Ok(ForkResult::Parent { child, .. }) => {
-///        println!("Continuing execution in parent process, new child has pid: {}", child);
-///        waitpid(child, None).unwrap();
-///    }
-///    Ok(ForkResult::Child) => {
-///        // Unsafe to use `println!` (or `unwrap`) here. See Safety.
-///        write(libc::STDOUT_FILENO, "I'm a new child process\n".as_bytes()).ok();
-///        unsafe { libc::_exit(0) };
-///    }
-///    Err(_) => println!("Fork failed"),
+/// match unsafe { fork() } {
+///     Ok(ForkResult::Parent { child, .. }) => {
+///         println!(
+///             "Continuing execution in parent process, new child has pid: {}",
+///             child
+///         );
+///         waitpid(child, None).unwrap();
+///     }
+///     Ok(ForkResult::Child) => {
+///         // Unsafe to use `println!` (or `unwrap`) here. See Safety.
+///         write(
+///             unsafe { &BorrowedFd::borrow_raw(libc::STDOUT_FILENO) },
+///             "I'm a new child process\n".as_bytes(),
+///         )
+///         .ok();
+///         unsafe { libc::_exit(0) };
+///     }
+///     Err(_) => println!("Fork failed"),
 /// }
 /// ```
 ///
@@ -425,10 +439,10 @@ feature! {
 ///
 /// The two file descriptors do not share file descriptor flags (e.g. `OFlag::FD_CLOEXEC`).
 #[inline]
-pub fn dup(oldfd: RawFd) -> Result<RawFd> {
-    let res = unsafe { libc::dup(oldfd) };
+pub fn dup(oldfd: &impl AsFd) -> Result<OwnedFd> {
+    let res = unsafe { libc::dup(oldfd.as_fd().as_raw_fd()) };
 
-    Errno::result(res)
+    Errno::result(res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Create a copy of the specified file descriptor using the specified fd (see
@@ -438,10 +452,19 @@ pub fn dup(oldfd: RawFd) -> Result<RawFd> {
 /// specified fd instead of allocating a new one.  See the man pages for more
 /// detail on the exact behavior of this function.
 #[inline]
-pub fn dup2(oldfd: RawFd, newfd: RawFd) -> Result<RawFd> {
-    let res = unsafe { libc::dup2(oldfd, newfd) };
+pub fn dup2(oldfd: &impl AsFd, newfd: &mut OwnedFd) -> Result<()> {
+    let res =
+        unsafe { libc::dup2(oldfd.as_fd().as_raw_fd(), newfd.as_raw_fd()) };
 
-    Errno::result(res)
+    Errno::result(res).map(drop)
+}
+
+#[cfg(feature = "fs")]
+libc_bitflags! {
+    #[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
+    pub struct DupFlags: i32 {
+        O_CLOEXEC;
+    }
 }
 
 /// Create a new copy of the specified file descriptor using the specified fd
@@ -449,26 +472,16 @@ pub fn dup2(oldfd: RawFd, newfd: RawFd) -> Result<RawFd> {
 ///
 /// This function behaves similar to `dup2()` but allows for flags to be
 /// specified.
-pub fn dup3(oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<RawFd> {
-    dup3_polyfill(oldfd, newfd, flags)
-}
+pub fn dup3(
+    oldfd: &impl AsFd,
+    newfd: &mut OwnedFd,
+    flags: DupFlags,
+) -> Result<()> {
+    let res = unsafe {
+        libc::dup3(oldfd.as_fd().as_raw_fd(), newfd.as_raw_fd(), flags.bits())
+    };
 
-#[inline]
-fn dup3_polyfill(oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<RawFd> {
-    if oldfd == newfd {
-        return Err(Errno::EINVAL);
-    }
-
-    let fd = dup2(oldfd, newfd)?;
-
-    if flags.contains(OFlag::O_CLOEXEC) {
-        if let Err(e) = fcntl(fd, F_SETFD(FdFlag::FD_CLOEXEC)) {
-            let _ = close(fd);
-            return Err(e);
-        }
-    }
-
-    Ok(fd)
+    Errno::result(res).map(drop)
 }
 
 /// Change the current working directory of the calling process (see
@@ -477,10 +490,9 @@ fn dup3_polyfill(oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<RawFd> {
 /// This function may fail in a number of different scenarios.  See the man
 /// pages for additional details on possible failure cases.
 #[inline]
-pub fn chdir<P: ?Sized + NixPath>(path: &P) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe { libc::chdir(cstr.as_ptr()) }
-    })?;
+pub fn chdir(path: &(impl ?Sized + NixPath)) -> Result<()> {
+    let res =
+        path.with_nix_path(|cstr| unsafe { libc::chdir(cstr.as_ptr()) })?;
 
     Errno::result(res).map(drop)
 }
@@ -493,8 +505,8 @@ pub fn chdir<P: ?Sized + NixPath>(path: &P) -> Result<()> {
 /// pages for additional details on possible failure cases.
 #[inline]
 #[cfg(not(target_os = "fuchsia"))]
-pub fn fchdir(dirfd: RawFd) -> Result<()> {
-    let res = unsafe { libc::fchdir(dirfd) };
+pub fn fchdir(dirfd: &impl AsFd) -> Result<()> {
+    let res = unsafe { libc::fchdir(dirfd.as_fd().as_raw_fd()) };
 
     Errno::result(res).map(drop)
 }
@@ -526,9 +538,9 @@ pub fn fchdir(dirfd: RawFd) -> Result<()> {
 /// }
 /// ```
 #[inline]
-pub fn mkdir<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe { libc::mkdir(cstr.as_ptr(), mode.bits() as mode_t) }
+pub fn mkdir(path: &(impl ?Sized + NixPath), mode: Mode) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::mkdir(cstr.as_ptr(), mode.bits() as mode_t)
     })?;
 
     Errno::result(res).map(drop)
@@ -565,9 +577,9 @@ pub fn mkdir<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<()> {
 /// ```
 #[inline]
 #[cfg(not(target_os = "redox"))] // RedoxFS does not support fifo yet
-pub fn mkfifo<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe { libc::mkfifo(cstr.as_ptr(), mode.bits() as mode_t) }
+pub fn mkfifo(path: &(impl ?Sized + NixPath), mode: Mode) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::mkfifo(cstr.as_ptr(), mode.bits() as mode_t)
     })?;
 
     Errno::result(res).map(drop)
@@ -585,11 +597,23 @@ pub fn mkfifo<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<()> {
 // mkfifoat is not implemented in OSX or android
 #[inline]
 #[cfg(not(any(
-    target_os = "macos", target_os = "ios", target_os = "haiku",
-    target_os = "android", target_os = "redox")))]
-pub fn mkfifoat<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P, mode: Mode) -> Result<()> {
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "haiku",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub fn mkfifoat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
+    mode: Mode,
+) -> Result<()> {
     let res = path.with_nix_path(|cstr| unsafe {
-        libc::mkfifoat(at_rawfd(dirfd), cstr.as_ptr(), mode.bits() as mode_t)
+        libc::mkfifoat(
+            dirfd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            mode.bits() as mode_t,
+        )
     })?;
 
     Errno::result(res).map(drop)
@@ -605,22 +629,20 @@ pub fn mkfifoat<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P, mode: Mode)
 ///
 /// See also [symlinkat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/symlinkat.html).
 #[cfg(not(target_os = "redox"))]
-pub fn symlinkat<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
-    path1: &P1,
-    dirfd: Option<RawFd>,
-    path2: &P2) -> Result<()> {
-    let res =
-        path1.with_nix_path(|path1| {
-            path2.with_nix_path(|path2| {
-                unsafe {
-                    libc::symlinkat(
-                        path1.as_ptr(),
-                        dirfd.unwrap_or(libc::AT_FDCWD),
-                        path2.as_ptr()
-                    )
-                }
-            })
-        })??;
+pub fn symlinkat(
+    path1: &(impl ?Sized + NixPath),
+    dirfd: &impl AsFd,
+    path2: &(impl ?Sized + NixPath),
+) -> Result<()> {
+    let res = path1.with_nix_path(|path1| {
+        path2.with_nix_path(|path2| unsafe {
+            libc::symlinkat(
+                path1.as_ptr(),
+                dirfd.as_fd().as_raw_fd(),
+                path2.as_ptr(),
+            )
+        })
+    })??;
     Errno::result(res).map(drop)
 }
 }
@@ -695,13 +717,18 @@ feature! {
 /// Computes the raw UID and GID values to pass to a `*chown` call.
 // The cast is not unnecessary on all platforms.
 #[allow(clippy::unnecessary_cast)]
-fn chown_raw_ids(owner: Option<Uid>, group: Option<Gid>) -> (libc::uid_t, libc::gid_t) {
+fn chown_raw_ids(
+    owner: Option<Uid>,
+    group: Option<Gid>,
+) -> (uid_t, gid_t) {
     // According to the POSIX specification, -1 is used to indicate that owner and group
     // are not to be changed.  Since uid_t and gid_t are unsigned types, we have to wrap
     // around to get -1.
-    let uid = owner.map(Into::into)
+    let uid = owner
+        .map(Into::into)
         .unwrap_or_else(|| (0 as uid_t).wrapping_sub(1));
-    let gid = group.map(Into::into)
+    let gid = group
+        .map(Into::into)
         .unwrap_or_else(|| (0 as gid_t).wrapping_sub(1));
     (uid, gid)
 }
@@ -714,7 +741,11 @@ fn chown_raw_ids(owner: Option<Uid>, group: Option<Gid>) -> (libc::uid_t, libc::
 /// provided for that argument.  Ownership change will be attempted for the path
 /// only if `Some` owner/group is provided.
 #[inline]
-pub fn chown<P: ?Sized + NixPath>(path: &P, owner: Option<Uid>, group: Option<Gid>) -> Result<()> {
+pub fn chown(
+    path: &(impl ?Sized + NixPath),
+    owner: Option<Uid>,
+    group: Option<Gid>,
+) -> Result<()> {
     let res = path.with_nix_path(|cstr| {
         let (uid, gid) = chown_raw_ids(owner, group);
         unsafe { libc::chown(cstr.as_ptr(), uid, gid) }
@@ -731,9 +762,13 @@ pub fn chown<P: ?Sized + NixPath>(path: &P, owner: Option<Uid>, group: Option<Gi
 /// provided for that argument.  Ownership change will be attempted for the path
 /// only if `Some` owner/group is provided.
 #[inline]
-pub fn fchown(fd: RawFd, owner: Option<Uid>, group: Option<Gid>) -> Result<()> {
+pub fn fchown(
+    fd: &impl AsFd,
+    owner: Option<Uid>,
+    group: Option<Gid>,
+) -> Result<()> {
     let (uid, gid) = chown_raw_ids(owner, group);
-    let res = unsafe { libc::fchown(fd, uid, gid) };
+    let res = unsafe { libc::fchown(fd.as_fd().as_raw_fd(), uid, gid) };
     Errno::result(res).map(drop)
 }
 
@@ -766,22 +801,26 @@ pub enum FchownatFlags {
 ///
 /// [fchownat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/fchownat.html).
 #[cfg(not(target_os = "redox"))]
-pub fn fchownat<P: ?Sized + NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
+pub fn fchownat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     owner: Option<Uid>,
     group: Option<Gid>,
     flag: FchownatFlags,
 ) -> Result<()> {
-    let atflag =
-        match flag {
-            FchownatFlags::FollowSymlink => AtFlags::empty(),
-            FchownatFlags::NoFollowSymlink => AtFlags::AT_SYMLINK_NOFOLLOW,
-        };
+    let atflag = match flag {
+        FchownatFlags::FollowSymlink => AtFlags::empty(),
+        FchownatFlags::NoFollowSymlink => AtFlags::AT_SYMLINK_NOFOLLOW,
+    };
     let res = path.with_nix_path(|cstr| unsafe {
         let (uid, gid) = chown_raw_ids(owner, group);
-        libc::fchownat(at_rawfd(dirfd), cstr.as_ptr(), uid, gid,
-                       atflag.bits() as libc::c_int)
+        libc::fchownat(
+            dirfd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            uid,
+            gid,
+            atflag.bits() as c_int,
+        )
     })?;
 
     Errno::result(res).map(drop)
@@ -808,13 +847,10 @@ fn to_exec_array<S: AsRef<CStr>>(args: &[S]) -> Vec<*const c_char> {
 pub fn execv<S: AsRef<CStr>>(path: &CStr, argv: &[S]) -> Result<Infallible> {
     let args_p = to_exec_array(argv);
 
-    unsafe {
-        libc::execv(path.as_ptr(), args_p.as_ptr())
-    };
+    unsafe { libc::execv(path.as_ptr(), args_p.as_ptr()) };
 
     Err(Errno::last())
 }
-
 
 /// Replace the current process image with a new one (see
 /// [execve(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/exec.html)).
@@ -829,13 +865,15 @@ pub fn execv<S: AsRef<CStr>>(path: &CStr, argv: &[S]) -> Result<Infallible> {
 /// in the `args` list is an argument to the new process. Each element in the
 /// `env` list should be a string in the form "key=value".
 #[inline]
-pub fn execve<SA: AsRef<CStr>, SE: AsRef<CStr>>(path: &CStr, args: &[SA], env: &[SE]) -> Result<Infallible> {
+pub fn execve<SA: AsRef<CStr>, SE: AsRef<CStr>>(
+    path: &CStr,
+    args: &[SA],
+    env: &[SE],
+) -> Result<Infallible> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
-    unsafe {
-        libc::execve(path.as_ptr(), args_p.as_ptr(), env_p.as_ptr())
-    };
+    unsafe { libc::execve(path.as_ptr(), args_p.as_ptr(), env_p.as_ptr()) };
 
     Err(Errno::last())
 }
@@ -850,12 +888,13 @@ pub fn execve<SA: AsRef<CStr>, SE: AsRef<CStr>>(path: &CStr, args: &[SA], env: &
 /// would not work if "bash" was specified for the path argument, but `execvp`
 /// would assuming that a bash executable was on the system `PATH`.
 #[inline]
-pub fn execvp<S: AsRef<CStr>>(filename: &CStr, args: &[S]) -> Result<Infallible> {
+pub fn execvp<S: AsRef<CStr>>(
+    filename: &CStr,
+    args: &[S],
+) -> Result<Infallible> {
     let args_p = to_exec_array(args);
 
-    unsafe {
-        libc::execvp(filename.as_ptr(), args_p.as_ptr())
-    };
+    unsafe { libc::execvp(filename.as_ptr(), args_p.as_ptr()) };
 
     Err(Errno::last())
 }
@@ -867,10 +906,12 @@ pub fn execvp<S: AsRef<CStr>>(filename: &CStr, args: &[S]) -> Result<Infallible>
 /// This functions like a combination of `execvp(2)` and `execve(2)` to pass an
 /// environment and have a search path. See these two for additional
 /// information.
-#[cfg(any(target_os = "haiku",
-          target_os = "linux",
-          target_os = "openbsd"))]
-pub fn execvpe<SA: AsRef<CStr>, SE: AsRef<CStr>>(filename: &CStr, args: &[SA], env: &[SE]) -> Result<Infallible> {
+#[cfg(any(target_os = "haiku", target_os = "linux", target_os = "openbsd"))]
+pub fn execvpe<SA: AsRef<CStr>, SE: AsRef<CStr>>(
+    filename: &CStr,
+    args: &[SA],
+    env: &[SE],
+) -> Result<Infallible> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
@@ -891,18 +932,22 @@ pub fn execvpe<SA: AsRef<CStr>, SE: AsRef<CStr>>(filename: &CStr, args: &[SA], e
 ///
 /// This function is similar to `execve`, except that the program to be executed
 /// is referenced as a file descriptor instead of a path.
-#[cfg(any(target_os = "android",
-          target_os = "linux",
-          target_os = "dragonfly",
-          target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd"
+))]
 #[inline]
-pub fn fexecve<SA: AsRef<CStr> ,SE: AsRef<CStr>>(fd: RawFd, args: &[SA], env: &[SE]) -> Result<Infallible> {
+pub fn fexecve<SA: AsRef<CStr>, SE: AsRef<CStr>>(
+    fd: &impl AsFd,
+    args: &[SA],
+    env: &[SE],
+) -> Result<Infallible> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
-    unsafe {
-        libc::fexecve(fd, args_p.as_ptr(), env_p.as_ptr())
-    };
+    unsafe { libc::fexecve(fd.as_fd().as_raw_fd(), args_p.as_ptr(), env_p.as_ptr()) };
 
     Err(Errno::last())
 }
@@ -919,14 +964,25 @@ pub fn fexecve<SA: AsRef<CStr> ,SE: AsRef<CStr>>(fd: RawFd, args: &[SA], env: &[
 /// is referenced as a file descriptor to the base directory plus a path.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[inline]
-pub fn execveat<SA: AsRef<CStr>,SE: AsRef<CStr>>(dirfd: RawFd, pathname: &CStr, args: &[SA],
-                env: &[SE], flags: super::fcntl::AtFlags) -> Result<Infallible> {
+pub fn execveat<SA: AsRef<CStr>, SE: AsRef<CStr>>(
+    dirfd: &impl AsFd,
+    pathname: &CStr,
+    args: &[SA],
+    env: &[SE],
+    flags: super::fcntl::AtFlags,
+) -> Result<Infallible> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
     unsafe {
-        libc::syscall(libc::SYS_execveat, dirfd, pathname.as_ptr(),
-                      args_p.as_ptr(), env_p.as_ptr(), flags);
+        libc::syscall(
+            libc::SYS_execveat,
+            dirfd.as_fd().as_raw_fd(),
+            pathname.as_ptr(),
+            args_p.as_ptr(),
+            env_p.as_ptr(),
+            flags,
+        );
     };
 
     Err(Errno::last())
@@ -957,14 +1013,16 @@ pub fn execveat<SA: AsRef<CStr>,SE: AsRef<CStr>>(dirfd: RawFd, pathname: &CStr, 
 ///   descriptors will remain identical after daemonizing.
 /// * `noclose = false`: The process' stdin, stdout, and stderr will point to
 ///   `/dev/null` after daemonizing.
-#[cfg(any(target_os = "android",
-          target_os = "dragonfly",
-          target_os = "freebsd",
-          target_os = "illumos",
-          target_os = "linux",
-          target_os = "netbsd",
-          target_os = "openbsd",
-          target_os = "solaris"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris"
+))]
 pub fn daemon(nochdir: bool, noclose: bool) -> Result<()> {
     let res = unsafe { libc::daemon(nochdir as c_int, noclose as c_int) };
     Errno::result(res).map(drop)
@@ -1045,32 +1103,28 @@ pub fn gethostname() -> Result<OsString> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use std::os::unix::io::AsRawFd;
-/// use nix::unistd::close;
-///
-/// let f = tempfile::tempfile().unwrap();
-/// close(f.as_raw_fd()).unwrap();   // Bad!  f will also close on drop!
-/// ```
-///
 /// ```rust
-/// use std::os::unix::io::IntoRawFd;
+/// use std::os::unix::io::AsFd;
 /// use nix::unistd::close;
 ///
 /// let f = tempfile::tempfile().unwrap();
-/// close(f.into_raw_fd()).unwrap(); // Good.  into_raw_fd consumes f
+/// close(f).unwrap();
 /// ```
-pub fn close(fd: RawFd) -> Result<()> {
-    let res = unsafe { libc::close(fd) };
+pub fn close(fd: impl IntoRawFd) -> Result<()> {
+    let res = unsafe { libc::close(fd.into_raw_fd()) };
     Errno::result(res).map(drop)
 }
 
 /// Read from a raw file descriptor.
 ///
 /// See also [read(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html)
-pub fn read(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
+pub fn read(fd: &impl AsFd, buf: &mut [u8]) -> Result<usize> {
     let res = unsafe {
-        libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len() as size_t)
+        libc::read(
+            fd.as_fd().as_raw_fd(),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as size_t,
+        )
     };
 
     Errno::result(res).map(|r| r as usize)
@@ -1079,9 +1133,13 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
 /// Write to a raw file descriptor.
 ///
 /// See also [write(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html)
-pub fn write(fd: RawFd, buf: &[u8]) -> Result<usize> {
+pub fn write(fd: &impl AsFd, buf: &[u8]) -> Result<usize> {
     let res = unsafe {
-        libc::write(fd, buf.as_ptr() as *const c_void, buf.len() as size_t)
+        libc::write(
+            fd.as_fd().as_raw_fd(),
+            buf.as_ptr() as *const c_void,
+            buf.len() as size_t,
+        )
     };
 
     Errno::result(res).map(|r| r as usize)
@@ -1106,37 +1164,47 @@ pub enum Whence {
     /// Specify an offset relative to the next location in the file greater than or
     /// equal to offset that contains some data. If offset points to
     /// some data, then the file offset is set to offset.
-    #[cfg(any(target_os = "dragonfly",
-              target_os = "freebsd",
-              target_os = "illumos",
-              target_os = "linux",
-              target_os = "solaris"))]
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "solaris"
+    ))]
     SeekData = libc::SEEK_DATA,
     /// Specify an offset relative to the next hole in the file greater than
     /// or equal to offset. If offset points into the middle of a hole, then
     /// the file offset should be set to offset. If there is no hole past offset,
     /// then the file offset should be adjusted to the end of the file (i.e., there
     /// is an implicit hole at the end of any file).
-    #[cfg(any(target_os = "dragonfly",
-              target_os = "freebsd",
-              target_os = "illumos",
-              target_os = "linux",
-              target_os = "solaris"))]
-    SeekHole = libc::SEEK_HOLE
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "solaris"
+    ))]
+    SeekHole = libc::SEEK_HOLE,
 }
 
 /// Move the read/write file offset.
 ///
 /// See also [lseek(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html)
-pub fn lseek(fd: RawFd, offset: off_t, whence: Whence) -> Result<off_t> {
-    let res = unsafe { libc::lseek(fd, offset, whence as i32) };
+pub fn lseek(fd: &impl AsFd, offset: off_t, whence: Whence) -> Result<off_t> {
+    let res =
+        unsafe { libc::lseek(fd.as_fd().as_raw_fd(), offset, whence as i32) };
 
     Errno::result(res).map(|r| r as off_t)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn lseek64(fd: RawFd, offset: libc::off64_t, whence: Whence) -> Result<libc::off64_t> {
-    let res = unsafe { libc::lseek64(fd, offset, whence as i32) };
+pub fn lseek64(
+    fd: &impl AsFd,
+    offset: libc::off64_t,
+    whence: Whence,
+) -> Result<libc::off64_t> {
+    let res =
+        unsafe { libc::lseek64(fd.as_fd().as_raw_fd(), offset, whence as i32) };
 
     Errno::result(res).map(|r| r as libc::off64_t)
 }
@@ -1145,14 +1213,18 @@ pub fn lseek64(fd: RawFd, offset: libc::off64_t, whence: Whence) -> Result<libc:
 /// Create an interprocess channel.
 ///
 /// See also [pipe(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/pipe.html)
-pub fn pipe() -> std::result::Result<(RawFd, RawFd), Error> {
+pub fn pipe() -> std::result::Result<(OwnedFd, OwnedFd), Error> {
     let mut fds = mem::MaybeUninit::<[c_int; 2]>::uninit();
 
     let res = unsafe { libc::pipe(fds.as_mut_ptr() as *mut c_int) };
 
     Error::result(res)?;
 
-    unsafe { Ok((fds.assume_init()[0], fds.assume_init()[1])) }
+    unsafe { Ok((fds.assume_init()[0], fds.assume_init()[1])) }.map(
+        |fds| unsafe {
+            (OwnedFd::from_raw_fd(fds.0), OwnedFd::from_raw_fd(fds.1))
+        },
+    )
 }
 
 feature! {
@@ -1163,31 +1235,42 @@ feature! {
 /// created:
 ///
 /// - `O_CLOEXEC`:    Set the close-on-exec flag for the new file descriptors.
-#[cfg_attr(target_os = "linux", doc = "- `O_DIRECT`: Create a pipe that performs I/O in \"packet\" mode.")]
-#[cfg_attr(target_os = "netbsd", doc = "- `O_NOSIGPIPE`: Return `EPIPE` instead of raising `SIGPIPE`.")]
+#[cfg_attr(
+    target_os = "linux",
+    doc = "- `O_DIRECT`: Create a pipe that performs I/O in \"packet\" mode."
+)]
+#[cfg_attr(
+    target_os = "netbsd",
+    doc = "- `O_NOSIGPIPE`: Return `EPIPE` instead of raising `SIGPIPE`."
+)]
 /// - `O_NONBLOCK`:   Set the non-blocking flag for the ends of the pipe.
 ///
 /// See also [pipe(2)](https://man7.org/linux/man-pages/man2/pipe.2.html)
-#[cfg(any(target_os = "android",
-          target_os = "dragonfly",
-          target_os = "emscripten",
-          target_os = "freebsd",
-          target_os = "illumos",
-          target_os = "linux",
-          target_os = "redox",
-          target_os = "netbsd",
-          target_os = "openbsd",
-          target_os = "solaris"))]
-pub fn pipe2(flags: OFlag) -> Result<(RawFd, RawFd)> {
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "emscripten",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "redox",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris"
+))]
+pub fn pipe2(flags: OFlag) -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = mem::MaybeUninit::<[c_int; 2]>::uninit();
 
-    let res = unsafe {
-        libc::pipe2(fds.as_mut_ptr() as *mut c_int, flags.bits())
-    };
+    let res =
+        unsafe { libc::pipe2(fds.as_mut_ptr() as *mut c_int, flags.bits()) };
 
     Errno::result(res)?;
 
-    unsafe { Ok((fds.assume_init()[0], fds.assume_init()[1])) }
+    unsafe { Ok((fds.assume_init()[0], fds.assume_init()[1])) }.map(
+        |fds| unsafe {
+            (OwnedFd::from_raw_fd(fds.0), OwnedFd::from_raw_fd(fds.1))
+        },
+    )
 }
 
 /// Truncate a file to a specified length
@@ -1195,12 +1278,9 @@ pub fn pipe2(flags: OFlag) -> Result<(RawFd, RawFd)> {
 /// See also
 /// [truncate(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/truncate.html)
 #[cfg(not(any(target_os = "redox", target_os = "fuchsia")))]
-pub fn truncate<P: ?Sized + NixPath>(path: &P, len: off_t) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::truncate(cstr.as_ptr(), len)
-        }
-    })?;
+pub fn truncate(path: &(impl ?Sized + NixPath), len: off_t) -> Result<()> {
+    let res = path
+        .with_nix_path(|cstr| unsafe { libc::truncate(cstr.as_ptr(), len) })?;
 
     Errno::result(res).map(drop)
 }
@@ -1209,22 +1289,23 @@ pub fn truncate<P: ?Sized + NixPath>(path: &P, len: off_t) -> Result<()> {
 ///
 /// See also
 /// [ftruncate(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/ftruncate.html)
-pub fn ftruncate(fd: RawFd, len: off_t) -> Result<()> {
-    Errno::result(unsafe { libc::ftruncate(fd, len) }).map(drop)
+pub fn ftruncate(fd: &impl AsFd, len: off_t) -> Result<()> {
+    Errno::result(unsafe { libc::ftruncate(fd.as_fd().as_raw_fd(), len) })
+        .map(drop)
 }
 
-pub fn isatty(fd: RawFd) -> Result<bool> {
+pub fn isatty(fd: &impl AsFd) -> Result<bool> {
     unsafe {
         // ENOTTY means `fd` is a valid file descriptor, but not a TTY, so
         // we return `Ok(false)`
-        if libc::isatty(fd) == 1 {
+        if libc::isatty(fd.as_fd().as_raw_fd()) == 1 {
             Ok(true)
         } else {
             match Errno::last() {
                 Errno::ENOTTY => Ok(false),
                 err => Err(err),
             }
-       }
+        }
     }
 }
 
@@ -1249,47 +1330,38 @@ pub enum LinkatFlags {
 /// # References
 /// See also [linkat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/linkat.html)
 #[cfg(not(target_os = "redox"))] // RedoxFS does not support symlinks yet
-pub fn linkat<P: ?Sized + NixPath>(
-    olddirfd: Option<RawFd>,
-    oldpath: &P,
-    newdirfd: Option<RawFd>,
-    newpath: &P,
+pub fn linkat(
+    olddirfd: &impl AsFd,
+    oldpath: &(impl ?Sized + NixPath),
+    newdirfd: &impl AsFd,
+    newpath: &(impl ?Sized + NixPath),
     flag: LinkatFlags,
 ) -> Result<()> {
+    let atflag = match flag {
+        LinkatFlags::SymlinkFollow => AtFlags::AT_SYMLINK_FOLLOW,
+        LinkatFlags::NoSymlinkFollow => AtFlags::empty(),
+    };
 
-    let atflag =
-        match flag {
-            LinkatFlags::SymlinkFollow => AtFlags::AT_SYMLINK_FOLLOW,
-            LinkatFlags::NoSymlinkFollow => AtFlags::empty(),
-        };
-
-    let res =
-        oldpath.with_nix_path(|oldcstr| {
-            newpath.with_nix_path(|newcstr| {
-            unsafe {
-                libc::linkat(
-                    at_rawfd(olddirfd),
-                    oldcstr.as_ptr(),
-                    at_rawfd(newdirfd),
-                    newcstr.as_ptr(),
-                    atflag.bits() as libc::c_int
-                    )
-                }
-            })
-        })??;
+    let res = oldpath.with_nix_path(|oldcstr| {
+        newpath.with_nix_path(|newcstr| unsafe {
+            libc::linkat(
+                olddirfd.as_fd().as_raw_fd(),
+                oldcstr.as_ptr(),
+                newdirfd.as_fd().as_raw_fd(),
+                newcstr.as_ptr(),
+                atflag.bits() as c_int,
+            )
+        })
+    })??;
     Errno::result(res).map(drop)
 }
-
 
 /// Remove a directory entry
 ///
 /// See also [unlink(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html)
-pub fn unlink<P: ?Sized + NixPath>(path: &P) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::unlink(cstr.as_ptr())
-        }
-    })?;
+pub fn unlink(path: &(impl ?Sized + NixPath)) -> Result<()> {
+    let res =
+        path.with_nix_path(|cstr| unsafe { libc::unlink(cstr.as_ptr()) })?;
     Errno::result(res).map(drop)
 }
 
@@ -1311,31 +1383,30 @@ pub enum UnlinkatFlags {
 /// # References
 /// See also [unlinkat(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlinkat.html)
 #[cfg(not(target_os = "redox"))]
-pub fn unlinkat<P: ?Sized + NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
+pub fn unlinkat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
     flag: UnlinkatFlags,
 ) -> Result<()> {
-    let atflag =
-        match flag {
-            UnlinkatFlags::RemoveDir => AtFlags::AT_REMOVEDIR,
-            UnlinkatFlags::NoRemoveDir => AtFlags::empty(),
-        };
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::unlinkat(at_rawfd(dirfd), cstr.as_ptr(), atflag.bits() as libc::c_int)
-        }
+    let atflag = match flag {
+        UnlinkatFlags::RemoveDir => AtFlags::AT_REMOVEDIR,
+        UnlinkatFlags::NoRemoveDir => AtFlags::empty(),
+    };
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::unlinkat(
+            dirfd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            atflag.bits() as c_int,
+        )
     })?;
     Errno::result(res).map(drop)
 }
 
-
 #[inline]
 #[cfg(not(target_os = "fuchsia"))]
-pub fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe { libc::chroot(cstr.as_ptr()) }
-    })?;
+pub fn chroot(path: &(impl ?Sized + NixPath)) -> Result<()> {
+    let res =
+        path.with_nix_path(|cstr| unsafe { libc::chroot(cstr.as_ptr()) })?;
 
     Errno::result(res).map(drop)
 }
@@ -1359,8 +1430,8 @@ pub fn sync() {
 ///
 /// See also [syncfs(2)](https://man7.org/linux/man-pages/man2/sync.2.html)
 #[cfg(target_os = "linux")]
-pub fn syncfs(fd: RawFd) -> Result<()> {
-    let res = unsafe { libc::syncfs(fd) };
+pub fn syncfs(fd: &impl AsFd) -> Result<()> {
+    let res = unsafe { libc::syncfs(fd.as_fd().as_raw_fd()) };
 
     Errno::result(res).map(drop)
 }
@@ -1369,8 +1440,8 @@ pub fn syncfs(fd: RawFd) -> Result<()> {
 ///
 /// See also [fsync(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/fsync.html)
 #[inline]
-pub fn fsync(fd: RawFd) -> Result<()> {
-    let res = unsafe { libc::fsync(fd) };
+pub fn fsync(fd: &impl AsFd) -> Result<()> {
+    let res = unsafe { libc::fsync(fd.as_fd().as_raw_fd()) };
 
     Errno::result(res).map(drop)
 }
@@ -1379,18 +1450,20 @@ pub fn fsync(fd: RawFd) -> Result<()> {
 ///
 /// See also
 /// [fdatasync(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/fdatasync.html)
-#[cfg(any(target_os = "linux",
-          target_os = "android",
-          target_os = "emscripten",
-          target_os = "freebsd",
-          target_os = "fuchsia",
-          target_os = "netbsd",
-          target_os = "openbsd",
-          target_os = "illumos",
-          target_os = "solaris"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
 #[inline]
-pub fn fdatasync(fd: RawFd) -> Result<()> {
-    let res = unsafe { libc::fdatasync(fd) };
+pub fn fdatasync(fd: &impl AsFd) -> Result<()> {
+    let res = unsafe { libc::fdatasync(fd.as_fd().as_raw_fd()) };
 
     Errno::result(res).map(drop)
 }
@@ -1860,7 +1933,7 @@ pub mod acct {
     /// Enable process accounting
     ///
     /// See also [acct(2)](https://linux.die.net/man/2/acct)
-    pub fn enable<P: ?Sized + NixPath>(filename: &P) -> Result<()> {
+    pub fn enable(filename: &(impl ?Sized + NixPath)) -> Result<()> {
         let res = filename.with_nix_path(|cstr| {
             unsafe { libc::acct(cstr.as_ptr()) }
         })?;
@@ -1904,7 +1977,7 @@ feature! {
 /// // do something with fd
 /// ```
 #[inline]
-pub fn mkstemp<P: ?Sized + NixPath>(template: &P) -> Result<(RawFd, PathBuf)> {
+pub fn mkstemp(template: &(impl ?Sized + NixPath)) -> Result<(RawFd, PathBuf)> {
     let mut path = template.with_nix_path(|path| {path.to_bytes_with_nul().to_owned()})?;
     let p = path.as_mut_ptr() as *mut _;
     let fd = unsafe { libc::mkstemp(p) };
@@ -2093,7 +2166,7 @@ pub fn fpathconf(fd: RawFd, var: PathconfVar) -> Result<Option<c_long>> {
 /// - `Ok(None)`: the variable has no limit (for limit variables) or is
 ///     unsupported (for option variables)
 /// - `Err(x)`: an error occurred
-pub fn pathconf<P: ?Sized + NixPath>(path: &P, var: PathconfVar) -> Result<Option<c_long>> {
+pub fn pathconf(path: &(impl ?Sized + NixPath), var: PathconfVar) -> Result<Option<c_long>> {
     let raw = path.with_nix_path(|cstr| {
         unsafe {
             Errno::clear();
@@ -2739,27 +2812,28 @@ pub fn sysconf(var: SysconfVar) -> Result<Option<c_long>> {
 }
 }
 
-feature! {
-#![feature = "fs"]
-
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(feature = "fs")]
 mod pivot_root {
-    use crate::{Result, NixPath};
     use crate::errno::Errno;
+    use crate::{NixPath, Result};
 
-    pub fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
-            new_root: &P1, put_old: &P2) -> Result<()> {
+    pub fn pivot_root(
+        new_root: &(impl ?Sized + NixPath),
+        put_old: &(impl ?Sized + NixPath),
+    ) -> Result<()> {
         let res = new_root.with_nix_path(|new_root| {
-            put_old.with_nix_path(|put_old| {
-                unsafe {
-                    libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), put_old.as_ptr())
-                }
+            put_old.with_nix_path(|put_old| unsafe {
+                libc::syscall(
+                    libc::SYS_pivot_root,
+                    new_root.as_ptr(),
+                    put_old.as_ptr(),
+                )
             })
         })??;
 
         Errno::result(res).map(drop)
     }
-}
 }
 
 #[cfg(any(
@@ -2903,11 +2977,9 @@ feature! {
 
 /// Checks the file named by `path` for accessibility according to the flags given by `amode`
 /// See [access(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/access.html)
-pub fn access<P: ?Sized + NixPath>(path: &P, amode: AccessFlags) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::access(cstr.as_ptr(), amode.bits)
-        }
+pub fn access(path: &(impl ?Sized + NixPath), amode: AccessFlags) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::access(cstr.as_ptr(), amode.bits)
     })?;
     Errno::result(res).map(drop)
 }
@@ -2923,11 +2995,19 @@ pub fn access<P: ?Sized + NixPath>(path: &P, amode: AccessFlags) -> Result<()> {
 /// [faccessat(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/faccessat.html)
 // redox: does not appear to support the *at family of syscalls.
 #[cfg(not(target_os = "redox"))]
-pub fn faccessat<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P, mode: AccessFlags, flags: AtFlags) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::faccessat(at_rawfd(dirfd), cstr.as_ptr(), mode.bits(), flags.bits())
-        }
+pub fn faccessat(
+    dirfd: &impl AsFd,
+    path: &(impl ?Sized + NixPath),
+    mode: AccessFlags,
+    flags: AtFlags,
+) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::faccessat(
+            dirfd.as_fd().as_raw_fd(),
+            cstr.as_ptr(),
+            mode.bits(),
+            flags.bits(),
+        )
     })?;
     Errno::result(res).map(drop)
 }
@@ -2944,11 +3024,9 @@ pub fn faccessat<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P, mode: Acce
     target_os = "freebsd",
     target_os = "dragonfly"
 ))]
-pub fn eaccess<P: ?Sized + NixPath>(path: &P, mode: AccessFlags) -> Result<()> {
-    let res = path.with_nix_path(|cstr| {
-        unsafe {
-            libc::eaccess(cstr.as_ptr(), mode.bits)
-        }
+pub fn eaccess(path: &(impl ?Sized + NixPath), mode: AccessFlags) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::eaccess(cstr.as_ptr(), mode.bits)
     })?;
     Errno::result(res).map(drop)
 }
@@ -3373,7 +3451,7 @@ feature! {
     target_os = "macos",
     target_os = "ios"
 ))]
-pub fn chflags<P: ?Sized + NixPath>(path: &P, flags: FileFlag) -> Result<()> {
+pub fn chflags(path: &(impl ?Sized + NixPath), flags: FileFlag) -> Result<()> {
     let res = path.with_nix_path(|cstr| unsafe {
         libc::chflags(cstr.as_ptr(), flags.bits())
     })?;
